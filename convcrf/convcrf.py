@@ -56,7 +56,7 @@ default_conf = {
     "weight_init": 0.2,
 
     'trainable': False,
-    'convcomp': False,
+    'convcomp': True,
     'logsoftmax': True,  # use logsoftmax for numerical stability
     'softmax': True,
     'final_softmax': False,
@@ -190,7 +190,7 @@ class GaussCRF(nn.Module):
         conf = self.conf
 
         bs, c, x, y = img.shape
-
+        # import pdb;pdb.set_trace()
         pos_feats = self.create_position_feats(sdims=self.pos_sdims, bs=bs)
         col_feats = self.create_colour_feats(
             img, sdims=self.col_sdims, schan=self.col_schan,
@@ -547,8 +547,10 @@ class ConvCRF(nn.Module):
             self.comp = nn.Conv2d(nclasses, nclasses,
                                   kernel_size=1, stride=1, padding=0,
                                   bias=False)
-
-            self.comp.weight.data.fill_(0.1 * math.sqrt(2.0 / nclasses))
+            # self.comp.weight.data.fill_(0.1 * math.sqrt(2.0 / nclasses))
+            self.comp.weight.data = torch.ones_like(self.comp.weight.data)
+            for i in range(self.nclasses):
+                self.comp.weight.data[i,i] = 0.
         else:
             self.comp = None
 
@@ -574,42 +576,37 @@ class ConvCRF(nn.Module):
             pyinn=self.pyinn)
 
     def inference(self, unary, num_iter=5):
-
+        # FIXME: unary must be logits from cam layer. psi_unary = -unary and prediction = softmax(unary)
         if not self.conf['logsoftmax']:
-            lg_unary = torch.log(unary)
-            prediction = exp_and_normalize(lg_unary, dim=1)
+            psi_unary = torch.log(unary)
+            prediction = exp_and_normalize(psi_unary, dim=1)
         else:
-            lg_unary = nnfun.log_softmax(unary, dim=1, _stacklevel=5)
-            if self.conf['softmax'] and False:
-                prediction = exp_and_normalize(lg_unary, dim=1)
+            # △ 0 Initialize: Q(i.e. prediction) and psi(i.e. psi_unary)
+            psi_unary = - nnfun.log_softmax(unary, dim=1, _stacklevel=5)
+            if self.conf['softmax']:
+                prediction = unary #nnfun.softmax(unary, dim=1) # exp_and_normalize(psi_unary, dim=1)
             else:
-                prediction = lg_unary
+                prediction = - psi_unary
 
         for i in range(num_iter):
+            # △ 1 Message passing
             message = self.kernel.compute(prediction)
-
+            # import pdb;pdb.set_trace()
+            # △ 2 Compatibility transform
             if self.comp is not None:
-                # message_r = message.view(tuple([1]) + message.shape)
-                comp = self.comp(message)
-                message = message + comp
+                message = self.comp(message)
 
+            # △ 3 Local Update (and normalize)
             if self.weight is None:
-                prediction = lg_unary + message
+                prediction = - psi_unary - message
             else:
-                prediction = (self.unary_weight - self.weight) * lg_unary + \
-                    self.weight * message
+                prediction = - (self.unary_weight - self.weight) * psi_unary - self.weight * message
 
             if not i == num_iter - 1 or self.final_softmax:
                 if self.conf['softmax']:
                     prediction = exp_and_normalize(prediction, dim=1)
 
         return prediction
-
-    def start_inference(self):
-        pass
-
-    def step_inference(self):
-        pass
 
 
 def get_test_conf():
