@@ -197,9 +197,10 @@ class GaussCRF(nn.Module):
             bias=conf['col_feats']['use_bias'], bs=bs)
 
         compats = [self.pos_compat, self.col_compat]
+        is_clsbd_list = [False, False]
 
         self.CRF.add_pairwise_energies([pos_feats, col_feats],
-                                       compats, conf['merge'])
+                                       compats, is_clsbd_list, conf['merge'])
 
         prediction = self.CRF.inference(unary, num_iter=num_iter)
 
@@ -276,7 +277,7 @@ class MessagePassingCol():
     The main magic happens here.
     """
 
-    def __init__(self, feat_list, compat_list, merge, npixels, nclasses,
+    def __init__(self, feat_list, compat_list, is_clsbd_list, merge, npixels, nclasses,
                  norm="sym",
                  filter_size=5, clip_edges=0, use_gpu=False,
                  blur=1, matmul=False, verbose=False, pyinn=False):
@@ -307,8 +308,8 @@ class MessagePassingCol():
         self._gaus_list = []
         self._norm_list = []
 
-        for feats, compat in zip(feat_list, compat_list):
-            gaussian = self._create_convolutional_filters(feats)
+        for feats, compat, is_clsbd in zip(feat_list, compat_list, is_clsbd_list):
+            gaussian = self._create_convolutional_filters(feats, is_clsbd)
             if not norm == "none":
                 mynorm = self._get_norm(gaussian)
                 self._norm_list.append(mynorm)
@@ -331,8 +332,81 @@ class MessagePassingCol():
 
         norm_out = self._compute_gaussian(normalization_feats, gaussian=gaus)
         return 1 / torch.sqrt(norm_out + 1e-20)
+    
+    def _get_circle_inds(self,span,i):
+        ii = [span-i]*(2*i+1) + list(np.repeat(list(range(span-i+1,span+i)),2)) + [span+i]*(2*i+1)
+        jj = list(range(span-i,span+i+1))+[span-i,span+i]*(2*i-1)+list(range(span-i,span+i+1))
+        return ii,jj
 
-    def _create_convolutional_filters(self, features):
+    def _expand_circle(self,tmp_arr,span,i):
+        # TODO: implement this. 
+        if i%2 == 1:
+            inds = [0]*2+list(range(1,2*i))+[2*i]*2+[0]+[2*i]+list(range(2*i+1,6*i-1))+[6*i-1]+[8*i-1]+[6*i-1]*2 + list(range(6*i,8*i-1))+[8*i-1]*2
+        else:
+            inds = [0,1] + list(range(1,2*i)) + [2*i-1] + [2*i] + [2*i+1, 2*i+2] + list(range(2*i+1,6*i-1)) + list(range(6*i-3,6*i+1)) + list(range(6*i,8*i-1)) + [8*i-2,8*i-1]
+        tmp_arr = tmp_arr[:,inds]
+        return tmp_arr
+
+    def _create_convolutional_filters_clsbd(self, features):
+        # features value range [0,1]
+        span = self.span    
+
+        bs = features.shape[0]
+
+        if self.blur > 1:
+            off_0 = (self.blur - self.npixels[0] % self.blur) % self.blur
+            off_1 = (self.blur - self.npixels[1] % self.blur) % self.blur
+            pad_0 = math.ceil(off_0 / 2)
+            pad_1 = math.ceil(off_1 / 2)
+            if self.blur == 2:
+                assert(pad_0 == self.npixels[0] % 2)
+                assert(pad_1 == self.npixels[1] % 2)
+
+            features = torch.nn.functional.avg_pool2d(features,
+                                                      kernel_size=self.blur,
+                                                      padding=(pad_0, pad_1),
+                                                      count_include_pad=False)
+
+            npixels = [math.ceil(self.npixels[0] / self.blur),
+                       math.ceil(self.npixels[1] / self.blur)]
+            assert(npixels[0] == features.shape[2])
+            assert(npixels[1] == features.shape[3])
+        else:
+            npixels = self.npixels
+
+        gaussian_tensor = features.data.new(
+            bs, self.filter_size, self.filter_size,
+            npixels[0], npixels[1]).fill_(0)
+
+        gaussian = Variable(gaussian_tensor)
+
+        # TODO: fill gaussian tensor
+            # goal: features [1, 1, 86, 125] --> col [1, 7, 7, 86, 125] -tmp_arr-> gaussian [1, 7, 7, 86, 125]
+        # 1. make col
+        cols = F.unfold(features, self.filter_size, 1, self.span)
+        cols = cols.view(bs, self.filter_size, self.filter_size, npixels[0], npixels[1]) #[1, 7, 7, 86, 125]
+        # 2. for i in range(span), fill gaussian
+        tmp_arr = cols.data.new(bs,8,npixels[0], npixels[1]).fill_(0)
+
+        for i in range(1,span+1):
+            # extract ith circle [1,i*8,86,125] from cols
+            ii, jj = self._get_circle_inds(span,i)
+            src_arr = cols[:,ii,jj]
+            # compare with tmp_arr, max to obtain new tmp_arr
+            tmp_arr = torch.max(src_arr,tmp_arr)
+            # assign tmp_arr to ith circle of gaussian
+            gaussian[:,ii,jj] += tmp_arr
+            # expand tmp_arr via index selection
+            tmp_arr = self._expand_circle(tmp_arr,span,i)
+            # Question: gaussian center element? 
+        gaussian = 1. - gaussian
+        gaussian[:,span,span] = 1.
+
+        return gaussian.view(
+            bs, 1, self.filter_size, self.filter_size,
+            npixels[0], npixels[1])
+
+    def _create_convolutional_filters(self, features, is_clsbd):
 
         span = self.span
 
@@ -365,21 +439,44 @@ class MessagePassingCol():
 
         gaussian = Variable(gaussian_tensor)
 
-        for dx in range(-span, span + 1):
-            for dy in range(-span, span + 1):
+        if is_clsbd:
+            # TODO: fill gaussian tensor
+            # goal: features [1, 1, 86, 125] --> col [1, 7, 7, 86, 125] -tmp_arr-> gaussian [1, 7, 7, 86, 125]
+            # 1. make col
+            cols = F.unfold(features, self.filter_size, 1, self.span)
+            cols = cols.view(bs, self.filter_size, self.filter_size, npixels[0], npixels[1]) #[1, 7, 7, 86, 125]
+            # 2. for i in range(span), fill gaussian
+            tmp_arr = cols.data.new(bs,8,npixels[0], npixels[1]).fill_(0)
 
-                dx1, dx2 = _get_ind(dx)
-                dy1, dy2 = _get_ind(dy)
+            for i in range(1,span+1):
+                # extract ith circle [1,i*8,86,125] from cols
+                ii, jj = self._get_circle_inds(span,i)
+                src_arr = cols[:,ii,jj]
+                # compare with tmp_arr, max to obtain new tmp_arr
+                tmp_arr = torch.max(src_arr,tmp_arr)
+                # assign tmp_arr to ith circle of gaussian
+                gaussian[:,ii,jj] += tmp_arr
+                # expand tmp_arr via index selection
+                tmp_arr = self._expand_circle(tmp_arr,span,i)
+                # Question: gaussian center element? 
+            gaussian = 1. - gaussian
+            gaussian[:,span,span] = 1.
+        else:
+            for dx in range(-span, span + 1):
+                for dy in range(-span, span + 1):
 
-                feat_t = features[:, :, dx1:_negative(dx2), dy1:_negative(dy2)]
-                feat_t2 = features[:, :, dx2:_negative(dx1), dy2:_negative(dy1)] # NOQA
+                    dx1, dx2 = _get_ind(dx)
+                    dy1, dy2 = _get_ind(dy)
 
-                diff = feat_t - feat_t2
-                diff_sq = diff * diff
-                exp_diff = torch.exp(torch.sum(-0.5 * diff_sq, dim=1))
+                    feat_t = features[:, :, dx1:_negative(dx2), dy1:_negative(dy2)]
+                    feat_t2 = features[:, :, dx2:_negative(dx1), dy2:_negative(dy1)] # NOQA
 
-                gaussian[:, dx + span, dy + span,
-                         dx2:_negative(dx1), dy2:_negative(dy1)] = exp_diff
+                    diff = feat_t - feat_t2
+                    diff_sq = diff * diff
+                    exp_diff = torch.exp(torch.sum(-0.5 * diff_sq, dim=1))
+
+                    gaussian[:, dx + span, dy + span,
+                            dx2:_negative(dx1), dy2:_negative(dy1)] = exp_diff
 
         return gaussian.view(
             bs, 1, self.filter_size, self.filter_size,
@@ -557,7 +654,7 @@ class ConvCRF(nn.Module):
     def clean_filters(self):
         self.kernel = None
 
-    def add_pairwise_energies(self, feat_list, compat_list, merge):
+    def add_pairwise_energies(self, feat_list, compat_list, is_clsbd_list, merge):
         assert(len(feat_list) == len(compat_list))
 
         assert(self.use_gpu)
@@ -565,6 +662,7 @@ class ConvCRF(nn.Module):
         self.kernel = MessagePassingCol(
             feat_list=feat_list,
             compat_list=compat_list,
+            is_clsbd_list=is_clsbd_list,
             merge=merge,
             npixels=self.npixels,
             filter_size=self.filter_size,
